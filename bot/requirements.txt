@@ -1,0 +1,18 @@
+# LionBrain Bot — Python 套件清單（純 Python，無 native DLL）
+# 安裝指令：py -m pip install -r requirements.txt
+
+# Telegram Bot 框架（含排程 JobQueue）
+python-telegram-bot[job-queue]>=21.0
+
+# 環境變數管理
+python-dotenv>=1.0.0
+
+# 時區處理
+pytz>=2024.1
+
+# HTTP 請求（直接呼叫 Gemini REST API）
+requests>=2.31.0
+charset-normalizer>=3.0.0
+
+# Claude API（週報深度分析）
+anthropic>=0.40.0

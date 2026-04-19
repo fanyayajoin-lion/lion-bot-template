@@ -1,0 +1,8 @@
+bot/.env
+bot/bot.log
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+Thumbs.db
+.obsidian/
