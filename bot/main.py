@@ -19,6 +19,8 @@ LionBrain Bot — Zeabur 雲端版（GitHub API）
 
 import base64
 import datetime
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import html
 import json
 import logging
@@ -34,6 +36,7 @@ from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    ConversationHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -112,6 +115,44 @@ def gh_write_file(path: str, content: str, message: str) -> bool:
     resp = requests.put(url, headers=gh_headers(), json=payload, timeout=30)
     resp.raise_for_status()
     return True
+
+_BOT_NAME_CACHE: str = ""
+_OWNER_NAME_CACHE: str = ""
+
+def get_bot_name() -> str:
+    global _BOT_NAME_CACHE
+    if _BOT_NAME_CACHE:
+        return _BOT_NAME_CACHE
+    content, _ = gh_read_file("identity/background.md")
+    if content:
+        m = re.search(r"## Bot 名稱\n(.+)", content)
+        if m:
+            _BOT_NAME_CACHE = m.group(1).strip()
+            return _BOT_NAME_CACHE
+    _BOT_NAME_CACHE = "AI 管家"
+    return _BOT_NAME_CACHE
+
+def get_owner_name() -> str:
+    global _OWNER_NAME_CACHE
+    if _OWNER_NAME_CACHE:
+        return _OWNER_NAME_CACHE
+    content, _ = gh_read_file("identity/background.md")
+    if content:
+        m = re.search(r"## 稱呼\n(.+)", content)
+        if m:
+            _OWNER_NAME_CACHE = m.group(1).strip()
+            return _OWNER_NAME_CACHE
+    _OWNER_NAME_CACHE = "業主"
+    return _OWNER_NAME_CACHE
+
+def _start_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        def log_message(self, *a): pass
+    threading.Thread(target=HTTPServer(("0.0.0.0", port), _H).serve_forever, daemon=True).start()
+    logger.info(f"Health server on port {port}")
 
 def gh_delete_file(path: str, sha: str) -> bool:
     """刪除 GitHub 上的檔案"""
@@ -552,14 +593,14 @@ async def send_morning_report(context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"早報情報存檔失敗: {e}")
 
     report = (
-        f"🦁 <b>LionBrain 早報 | {today}</b>\n\n"
+        f"🦁 <b>{get_bot_name()} 早報 | {today}</b>\n\n"
         f"🗂️ <b>昨日整理</b>\n{inbox_summary}\n\n"
         f"📌 <b>已入庫知識</b>\n{yesterday_ideas}\n\n"
         f"✅ <b>今日代辦</b>\n{todos}\n\n"
         f"📊 <b>案子狀態</b>\n{projects}\n\n"
         + (f"👥 <b>今日待跟進客戶</b>\n{crm_followups}\n\n" if crm_followups else "")
         + f"{news}\n\n"
-        f"━━━━━━━━━━━━━━━\n<i>小獅為你守好資訊陣地</i>"
+        f"━━━━━━━━━━━━━━━\n<i>{get_bot_name()}為你守好資訊陣地</i>"
     )
     await context.bot.send_message(chat_id=CHAT_ID_INT, text=report, parse_mode="HTML")
     logger.info("✅ 早報推送完成")
@@ -677,7 +718,7 @@ async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE):
 
     total = len(week_knowledge["areas"]) + len(week_knowledge["resources"])
     report = (
-        f"🦁 <b>群獅週報 | {week_start} ~ {today}</b>\n\n"
+        f"🦁 <b>{get_bot_name()} 週報 | {week_start} ~ {today}</b>\n\n"
         f"📊 <b>本週數字</b>\n"
         f"整理入庫：{total} 筆｜Zettel：{len(week_zettel)} 張\n\n"
         f"🗂️ <b>領域知識</b>\n{areas_section}\n\n"
@@ -685,7 +726,7 @@ async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE):
         f"🃏 <b>本週 Zettel（{len(week_zettel)} 張）</b>\n{zettel_section}\n\n"
         f"📁 <b>案子狀態</b>\n{projects_status}\n\n"
         f"🧠 <b>Claude 本週分析</b>\n{html.escape(claude_insight)}\n\n"
-        f"━━━━━━━━━━━━━━━\n<i>小獅週結，下週繼續前進</i>"
+        f"━━━━━━━━━━━━━━━\n<i>{get_bot_name()}週結，下週繼續前進</i>"
     )
     await context.bot.send_message(chat_id=CHAT_ID_INT, text=report, parse_mode="HTML")
 
@@ -992,6 +1033,135 @@ def crm_read_followups() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# /setup 自助開通問卷
+# ══════════════════════════════════════════════════════════════════════════════
+
+SETUP_BOT_NAME, SETUP_NAME, SETUP_BUSINESS, SETUP_PROJECTS, SETUP_TOPICS, SETUP_GOAL = range(6)
+
+def _setup_already_done() -> bool:
+    content, _ = gh_read_file("identity/background.md")
+    return bool(content) and "使用者是誰" not in content and "待設定" not in content and len(content) > 80
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+    if _setup_already_done():
+        bot_name = get_bot_name()
+        await update.message.reply_text(
+            f"{bot_name}已完成設定。\n\n要重新設定請傳 /setup reset，或直接開始使用！"
+        )
+        return ConversationHandler.END
+    context.user_data.clear()
+    await update.message.reply_text(
+        "你好！我是你的 AI 管家。\n\n"
+        "我需要了解你一點，才能每天給你最有用的早報和整理。\n"
+        "6 個問題，大約 2 分鐘。\n\n"
+        "第 1 題：你想叫我什麼名字？\n（例如：小幫手、小晶、AI管家）"
+    )
+    return SETUP_BOT_NAME
+
+async def setup_receive_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["bot_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"好的，以後叫我{context.user_data['bot_name']}！\n\n"
+        "第 2 題：你怎麼稱呼？（例如：小美、Leo、老闆）"
+    )
+    return SETUP_NAME
+
+async def setup_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"好的，{context.user_data['name']}！\n\n"
+        "第 3 題：你的主要行業或服務是什麼？\n（例如：命理塔羅諮詢、室內設計、烘焙教學）"
+    )
+    return SETUP_BUSINESS
+
+async def setup_receive_business(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["business"] = update.message.text.strip()
+    await update.message.reply_text(
+        "第 4 題：你現在有哪些進行中的業務線或案子？\n（用逗號分隔，例如：個案諮詢、科儀服務、線上課程）"
+    )
+    return SETUP_PROJECTS
+
+async def setup_receive_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["projects"] = update.message.text.strip()
+    await update.message.reply_text(
+        "第 5 題：你每天最想追蹤哪幾個資訊主題？\n（用逗號分隔，例如：塔羅靈性趨勢、IG短影音策略）"
+    )
+    return SETUP_TOPICS
+
+async def setup_receive_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["topics"] = update.message.text.strip()
+    await update.message.reply_text(
+        "最後一題！第 6 題：你目前最大的業務目標是什麼？\n（一句話，例如：今年做到月收 10 萬）"
+    )
+    return SETUP_GOAL
+
+async def setup_receive_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _BOT_NAME_CACHE, _OWNER_NAME_CACHE
+    context.user_data["goal"] = update.message.text.strip()
+    bot_name = context.user_data.get("bot_name", "AI 管家")
+    name     = context.user_data.get("name", "")
+    business = context.user_data.get("business", "")
+    projects = context.user_data.get("projects", "")
+    topics   = context.user_data.get("topics", "")
+    goal     = context.user_data.get("goal", "")
+    await update.message.reply_text("正在建立你的個人知識庫...")
+    try:
+        sep = "，" if "，" in topics else ","
+        topic_list = [t.strip() for t in topics.split(sep) if t.strip()][:4]
+        topic_list.append("Anthropic Claude 最新功能")
+        topics_numbered = "\n".join([f"{i+1}. {t}" for i, t in enumerate(topic_list)])
+        sep2 = "，" if "，" in projects else ","
+        project_list = [p.strip() for p in projects.split(sep2) if p.strip()]
+        projects_bullet = "\n".join([f"- {p}" for p in project_list])
+        gh_write_file("identity/background.md",
+            f"# 身份背景\n\n## Bot 名稱\n{bot_name}\n\n## 稱呼\n{name}\n\n## 行業 / 服務\n{business}\n\n## 業務目標\n{goal}\n\n## 最後更新\n{today_str()}\n",
+            f"setup: {name}")
+        gh_write_file("context/business-model.md",
+            f"# 商業模式\n\n## 主要服務\n{business}\n\n## 業務線\n{projects_bullet}\n\n## 業務目標\n{goal}\n\n## 最後更新\n{today_str()}\n",
+            "setup: 商業模式")
+        gh_write_file("context/focus.md",
+            f"# 每日情報關注主題\n\n{topics_numbered}\n",
+            "setup: 關注主題")
+        for proj in project_list:
+            safe = re.sub(r'[\\/:*?"<>|\s，,]+', '-', proj)[:30].strip('-')
+            path = f"projects/{safe}.md"
+            existing, _ = gh_read_file(path)
+            if not existing:
+                gh_write_file(path, f"# {proj}\n\n## 狀態：進行中\n## 目標：\n## 下一步：\n", f"setup: {proj}")
+        _BOT_NAME_CACHE = bot_name
+        _OWNER_NAME_CACHE = name
+        await update.message.reply_text(
+            f"設定完成！以後叫我{bot_name}。\n\n"
+            f"稱呼：{name}\n服務：{business}\n目標：{goal}\n\n"
+            f"每天早上 8:00 你會收到早報。\n現在就可以把想法、連結、語音丟給{bot_name}！"
+        )
+    except Exception as e:
+        logger.error(f"/setup 失敗: {e}", exc_info=True)
+        await update.message.reply_text(f"設定失敗，請稍後再試：{e}")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("設定已取消，隨時傳 /setup 重新開始。")
+    return ConversationHandler.END
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _setup_already_done():
+        await update.message.reply_text(
+            "你好！我是你的 AI 管家。\n\n"
+            "還沒完成初始設定，傳 /setup 開始 2 分鐘問卷，我就能為你量身打造每日早報！"
+        )
+    else:
+        bot_name = get_bot_name()
+        await update.message.reply_text(
+            f"{bot_name}就位！\n有任何想法、連結、語音都可以直接丟給我。\n\n"
+            "/status — 查看案子與代辦\n/test   — 立即觸發早報\n/setup  — 重新設定個人資料"
+        )
+
 # Telegram Handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1164,6 +1334,7 @@ async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    _start_health_server()
     if not TELEGRAM_TOKEN:
         raise ValueError("❌ TELEGRAM_TOKEN 未設定")
 
@@ -1171,6 +1342,20 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    setup_conv = ConversationHandler(
+        entry_points=[CommandHandler("setup", cmd_setup)],
+        states={
+            SETUP_BOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_receive_bot_name)],
+            SETUP_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_receive_name)],
+            SETUP_BUSINESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_receive_business)],
+            SETUP_PROJECTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_receive_projects)],
+            SETUP_TOPICS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_receive_topics)],
+            SETUP_GOAL:     [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_receive_goal)],
+        },
+        fallbacks=[CommandHandler("cancel", setup_cancel)],
+    )
+    app.add_handler(setup_conv)
+    app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("test",   cmd_test))
     app.add_handler(CommandHandler("myid",      cmd_myid))
