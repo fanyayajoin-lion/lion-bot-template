@@ -1316,8 +1316,6 @@ def extract_youtube_video_id(url: str) -> str | None:
             return m.group(1)
     return None
 
-def is_ig_url(url: str) -> bool:
-    return bool(re.search(r"instagram\.com/(reel|reels|p|tv)/", url))
 
 def fetch_url_content(url: str) -> str:
     """透過 Jina Reader 把任意網址轉成乾淨 Markdown（無需 API Key）"""
@@ -1393,30 +1391,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "• 或貼上影片重點讓我整理"
                 )
 
-        elif is_ig_url(url):
-            # ── Instagram 短影音 ──────────────────────────────────────
-            page_content = fetch_url_content(url)
-            if page_content and len(page_content) > 30:
-                prompt = (
-                    f"以下是 Instagram 短影音頁面的資訊，請用繁體中文整理：\n"
-                    f"1. 內容主題（根據標題和描述推測）\n"
-                    f"2. 可能的核心觀點（1-3 點）\n"
-                    f"3. 對傳產數位轉型或業務的潛在啟發\n\n"
-                    f"頁面資訊：\n{page_content[:2000]}"
-                )
-                summary = gemini_text(prompt)
-            else:
-                summary = (
-                    "⚠️ IG 影片需要登入才能讀取完整內容。\n\n"
-                    "已記錄連結。建議：\n"
-                    "• 回覆這則訊息補充你對這部影片的想法\n"
-                    "• 或描述影片主題讓我幫你整理"
-                )
-
         else:
-            # ── 一般連結：實際抓取頁面內容 ───────────────────────────
+            # ── 所有其他連結（含 IG）：Jina Reader ───────────────────
             page_content = fetch_url_content(url)
-            if page_content and len(page_content) > 50:
+            if page_content and len(page_content) >= 100:
                 prompt = (
                     f"以下是網頁的實際內容，請用繁體中文整理：\n"
                     f"1. 標題與主題\n"
@@ -1424,13 +1402,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"3. 對傳產數位轉型的啟發\n\n"
                     f"網頁內容：\n{page_content[:3000]}"
                 )
+                summary = gemini_text(prompt)
             else:
-                prompt = (
-                    f"請整理這個連結的重點，繁體中文：\n"
-                    f"1.標題\n2.核心重點3-5點\n3.對傳產數位轉型的啟發\n\n"
-                    f"連結：{url}"
-                )
-            summary = gemini_text(prompt)
+                summary = "這個連結需要登入才能讀取，請直接複製內容貼給我"
 
         # 組合內容（含用戶隨附想法）
         thought_section = f"\n\n## 業主想法\n{user_thought}" if user_thought else ""
