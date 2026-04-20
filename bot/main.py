@@ -1320,40 +1320,19 @@ def is_ig_url(url: str) -> bool:
     return bool(re.search(r"instagram\.com/(reel|reels|p|tv)/", url))
 
 def fetch_url_content(url: str) -> str:
-    """抓網頁 HTML，提取 OG tags + 內文節錄（前 2000 字）"""
+    """透過 Jina Reader 把任意網址轉成乾淨 Markdown（無需 API Key）"""
     try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        }
-        resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
-        ht = resp.text
-
-        def find_og(prop: str) -> str:
-            m = re.search(rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)', ht)
-            if not m:
-                m = re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:{prop}["\']', ht)
-            return html.unescape(m.group(1)) if m else ""
-
-        title = find_og("title") or re.sub(r"<[^>]+>", "", re.search(r"<title[^>]*>([^<]+)</title>", ht, re.I).group(1) if re.search(r"<title[^>]*>([^<]+)</title>", ht, re.I) else "")
-        desc  = find_og("description")
-
-        body = re.sub(r"<script[^>]*>.*?</script>", "", ht, flags=re.DOTALL)
-        body = re.sub(r"<style[^>]*>.*?</style>",  "", body, flags=re.DOTALL)
-        body = re.sub(r"<[^>]+>", " ", body)
-        body = re.sub(r"\s+", " ", body).strip()
-
-        parts = []
-        if title: parts.append(f"標題：{title.strip()}")
-        if desc:  parts.append(f"描述：{desc.strip()}")
-        if body:  parts.append(f"內文節錄：{body[:2000]}")
-        return "\n".join(parts)
+        jina_url = f"https://r.jina.ai/{url}"
+        resp = requests.get(
+            jina_url,
+            headers={"Accept": "text/markdown", "X-Return-Format": "markdown"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        text = resp.text.strip()
+        return text[:3000] if text else ""
     except Exception as e:
-        logger.warning(f"fetch_url_content 失敗 {url}: {e}")
+        logger.warning(f"fetch_url_content (Jina) 失敗 {url}: {e}")
         return ""
 
 def get_youtube_transcript(video_id: str) -> str | None:
