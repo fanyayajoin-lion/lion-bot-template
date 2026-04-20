@@ -16,3 +16,6 @@ charset-normalizer>=3.0.0
 
 # Claude API（週報深度分析）
 anthropic>=0.40.0
+
+# YouTube 字幕抓取（避免 Gemini 亂猜 YT 內容）
+youtube-transcript-api>=0.6.3
