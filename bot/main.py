@@ -56,6 +56,8 @@ GITHUB_OWNER      = os.getenv("GITHUB_OWNER", "pcsfanfan01-AI")
 GITHUB_REPO       = os.getenv("GITHUB_REPO", "LionBrain")
 MORNING_HOUR      = int(os.getenv("MORNING_HOUR", "8"))
 MORNING_MINUTE    = int(os.getenv("MORNING_MINUTE", "0"))
+CHANGELOG_HOUR    = int(os.getenv("CHANGELOG_HOUR", "4"))
+CHANGELOG_MINUTE  = int(os.getenv("CHANGELOG_MINUTE", "0"))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL      = "claude-sonnet-4-6"
 
@@ -558,6 +560,77 @@ def fetch_news() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 系統更新 Changelog（凌晨 4 點生成）
+# ══════════════════════════════════════════════════════════════════════════════
+
+def read_latest_changelog() -> str:
+    """讀今日或昨日的 changelog 摘要供早報使用"""
+    today     = today_str()
+    yesterday = (now_taipei().date() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    for date in [today, yesterday]:
+        content, _ = gh_read_file(f"memory/changelog/{date}.md")
+        if content:
+            m = re.search(r"##\s*更新摘要\n(.*?)(?=\n##|\Z)", content, re.DOTALL)
+            if m:
+                lines = [l.strip() for l in m.group(1).strip().splitlines() if l.strip()]
+                return html.escape("\n".join(lines[:6]))
+    return "<i>今日無系統更新記錄</i>"
+
+async def generate_system_changelog(context: ContextTypes.DEFAULT_TYPE):
+    """凌晨 4 點：讀昨日 session 日誌，用 Claude 提煉 CC 更新摘要，寫入 memory/changelog/"""
+    if not ANTHROPIC_API_KEY:
+        logger.warning("ANTHROPIC_API_KEY 未設定，跳過 changelog 生成")
+        return
+
+    today     = today_str()
+    yesterday = (now_taipei().date() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    daily_log, _ = gh_read_file(f"memory/daily/{yesterday}.md")
+    if not daily_log:
+        daily_log, _ = gh_read_file(f"memory/daily/{today}.md")
+    if not daily_log:
+        logger.info("changelog: 找不到 daily log，跳過")
+        return
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    try:
+        resp = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=600,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"以下是 LionBrain 系統昨日（{yesterday}）的 session 紀錄。\n"
+                    "請從中提煉「Claude Code 針對系統做了哪些更新或新增功能」，\n"
+                    "用條列式整理（每條 20 字內，以「•」開頭），最多 6 條。\n"
+                    "只列實際完成的功能變更，不要列討論或規劃。\n\n"
+                    f"{daily_log}"
+                )
+            }]
+        )
+        summary = resp.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Claude changelog 生成失敗: {e}")
+        return
+
+    changelog_content = (
+        f"---\ndate: {today}\ntype: system-changelog\n"
+        f"tags: [LionBrain, 系統更新, CC]\nsummary: {today} 系統更新摘要\n---\n\n"
+        f"# {today} 系統更新\n\n## 更新摘要\n{summary}\n"
+    )
+    try:
+        gh_write_file(
+            f"memory/changelog/{today}.md",
+            changelog_content,
+            f"changelog: {today} 系統更新"
+        )
+        logger.info(f"✅ changelog 已寫入 memory/changelog/{today}.md")
+    except Exception as e:
+        logger.error(f"changelog 寫入失敗: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 推送報告
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -584,6 +657,7 @@ async def send_morning_report(context: ContextTypes.DEFAULT_TYPE):
     projects        = read_projects_status()
     news            = fetch_news()
     crm_followups   = crm_read_followups() if crm_enabled() else ""
+    system_changelog = read_latest_changelog()
 
     # 早報情報存進 knowledge/resources/
     try:
@@ -605,6 +679,7 @@ async def send_morning_report(context: ContextTypes.DEFAULT_TYPE):
         f"📊 <b>案子狀態</b>\n{projects}\n\n"
         + (f"👥 <b>今日待跟進客戶</b>\n{crm_followups}\n\n" if crm_followups else "")
         + f"{news}\n\n"
+        f"🔧 <b>系統更新</b>\n{system_changelog}\n\n"
         f"━━━━━━━━━━━━━━━\n<i>{get_bot_name()}為你守好資訊陣地</i>"
     )
     await context.bot.send_message(chat_id=CHAT_ID_INT, text=report, parse_mode="HTML")
@@ -1241,6 +1316,46 @@ def extract_youtube_video_id(url: str) -> str | None:
             return m.group(1)
     return None
 
+def is_ig_url(url: str) -> bool:
+    return bool(re.search(r"instagram\.com/(reel|reels|p|tv)/", url))
+
+def fetch_url_content(url: str) -> str:
+    """抓網頁 HTML，提取 OG tags + 內文節錄（前 2000 字）"""
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        }
+        resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+        ht = resp.text
+
+        def find_og(prop: str) -> str:
+            m = re.search(rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)', ht)
+            if not m:
+                m = re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:{prop}["\']', ht)
+            return html.unescape(m.group(1)) if m else ""
+
+        title = find_og("title") or re.sub(r"<[^>]+>", "", re.search(r"<title[^>]*>([^<]+)</title>", ht, re.I).group(1) if re.search(r"<title[^>]*>([^<]+)</title>", ht, re.I) else "")
+        desc  = find_og("description")
+
+        body = re.sub(r"<script[^>]*>.*?</script>", "", ht, flags=re.DOTALL)
+        body = re.sub(r"<style[^>]*>.*?</style>",  "", body, flags=re.DOTALL)
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = re.sub(r"\s+", " ", body).strip()
+
+        parts = []
+        if title: parts.append(f"標題：{title.strip()}")
+        if desc:  parts.append(f"描述：{desc.strip()}")
+        if body:  parts.append(f"內文節錄：{body[:2000]}")
+        return "\n".join(parts)
+    except Exception as e:
+        logger.warning(f"fetch_url_content 失敗 {url}: {e}")
+        return ""
+
 def get_youtube_transcript(video_id: str) -> str | None:
     """取得 YT 字幕，優先繁中 → 簡中 → 英文 → 自動生成"""
     try:
@@ -1270,11 +1385,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = re.findall(r"https?://[^\s]+", text)
     if not urls:
         return
+
+    # 提取用戶隨附的想法（URL 以外的文字）
+    user_thought = re.sub(r"https?://[^\s]+", "", text).strip()
+
     await update.message.reply_text("🔗 收到連結，摘要中...")
     try:
         url = urls[0]
         video_id = extract_youtube_video_id(url)
+
         if video_id:
+            # ── YouTube ──────────────────────────────────────────────
             transcript = get_youtube_transcript(video_id)
             if transcript:
                 prompt = (
@@ -1284,25 +1405,74 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"3. 對傳產數位轉型的啟發\n\n"
                     f"字幕內容（前3000字）：\n{transcript[:3000]}"
                 )
+                summary = gemini_text(prompt)
+            else:
+                summary = (
+                    "⚠️ 此 YouTube 影片無法取得字幕（已停用或無字幕）。\n\n"
+                    "已記錄連結。建議：\n"
+                    "• 回覆這則訊息補充你對這部影片的想法\n"
+                    "• 或貼上影片重點讓我整理"
+                )
+
+        elif is_ig_url(url):
+            # ── Instagram 短影音 ──────────────────────────────────────
+            page_content = fetch_url_content(url)
+            if page_content and len(page_content) > 30:
+                prompt = (
+                    f"以下是 Instagram 短影音頁面的資訊，請用繁體中文整理：\n"
+                    f"1. 內容主題（根據標題和描述推測）\n"
+                    f"2. 可能的核心觀點（1-3 點）\n"
+                    f"3. 對傳產數位轉型或業務的潛在啟發\n\n"
+                    f"頁面資訊：\n{page_content[:2000]}"
+                )
+                summary = gemini_text(prompt)
+            else:
+                summary = (
+                    "⚠️ IG 影片需要登入才能讀取完整內容。\n\n"
+                    "已記錄連結。建議：\n"
+                    "• 回覆這則訊息補充你對這部影片的想法\n"
+                    "• 或描述影片主題讓我幫你整理"
+                )
+
+        else:
+            # ── 一般連結：實際抓取頁面內容 ───────────────────────────
+            page_content = fetch_url_content(url)
+            if page_content and len(page_content) > 50:
+                prompt = (
+                    f"以下是網頁的實際內容，請用繁體中文整理：\n"
+                    f"1. 標題與主題\n"
+                    f"2. 核心重點 3-5 點\n"
+                    f"3. 對傳產數位轉型的啟發\n\n"
+                    f"網頁內容：\n{page_content[:3000]}"
+                )
             else:
                 prompt = (
-                    f"這是一個 YouTube 影片連結，無法取得字幕。\n"
-                    f"請根據網址本身說明無法摘要，並提示使用者手動貼上字幕或說明影片主題。\n"
+                    f"請整理這個連結的重點，繁體中文：\n"
+                    f"1.標題\n2.核心重點3-5點\n3.對傳產數位轉型的啟發\n\n"
                     f"連結：{url}"
                 )
-        else:
-            prompt = (
-                f"請整理這個連結的重點，繁體中文：\n"
-                f"1.標題\n2.核心重點3-5點\n3.對傳產數位轉型的啟發\n\n"
-                f"連結：{url}"
-            )
-        summary = gemini_text(prompt)
-        content = f"# 連結摘要 {now_str()}\n\n來源：{url}\n\n{summary}"
+            summary = gemini_text(prompt)
+
+        # 組合內容（含用戶隨附想法）
+        thought_section = f"\n\n## 業主想法\n{user_thought}" if user_thought else ""
+        content = f"# 連結摘要 {now_str()}\n\n來源：{url}\n\n{summary}{thought_section}"
         path, meta = save_idea(content, "link")
+
+        # 存入 context 供 10 分鐘內回覆補記
+        context.user_data["last_saved"] = {"path": path, "ts": time.time()}
+
         preview = summary[:300] + ("..." if len(summary) > 300 else "")
-        await update.message.reply_text(
-            f"✅ 已存入 GitHub\n📁 專案：{meta.get('project','一般')}\n📌 {meta.get('summary','')}\n\n{preview}"
-        )
+        reply_parts = [
+            f"✅ 已存入 GitHub",
+            f"📁 專案：{meta.get('project','一般')}",
+            f"📌 {meta.get('summary','')}",
+            f"",
+            f"{preview}",
+        ]
+        if not user_thought:
+            reply_parts.append("\n💭 有感想？回覆這則訊息補記想法")
+        await update.message.reply_text("\n".join(reply_parts))
+
     except Exception as e:
         logger.error(f"連結處理失敗: {e}", exc_info=True)
         await update.message.reply_text("❌ 連結處理失敗，請稍後再試")
@@ -1313,6 +1483,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
+
+    # 回覆補記想法：回覆 Bot 的訊息 + 10 分鐘內有 last_saved
+    replied = update.message.reply_to_message
+    if replied and replied.from_user and replied.from_user.is_bot:
+        last_saved = context.user_data.get("last_saved")
+        if last_saved and (time.time() - last_saved["ts"]) < 600:
+            path = last_saved["path"]
+            existing, _ = gh_read_file(path)
+            if existing:
+                if "## 業主想法" in existing:
+                    updated = existing.rstrip() + f"\n{text}\n"
+                else:
+                    updated = existing.rstrip() + f"\n\n## 業主想法\n{text}\n"
+                gh_write_file(path, updated, f"thought: {path.split('/')[-1]}")
+                context.user_data.pop("last_saved", None)
+                await update.message.reply_text(f"💭 想法已補記！")
+                return
 
     intent = detect_intent(text)
     action = intent.get("action", "idea")
@@ -1428,11 +1615,13 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     jq = app.job_queue
-    morning_time = datetime.time(MORNING_HOUR, MORNING_MINUTE, tzinfo=TZ)
+    morning_time   = datetime.time(MORNING_HOUR, MORNING_MINUTE, tzinfo=TZ)
+    changelog_time = datetime.time(CHANGELOG_HOUR, CHANGELOG_MINUTE, tzinfo=TZ)
+    jq.run_daily(generate_system_changelog, time=changelog_time)
     jq.run_daily(send_morning_report, time=morning_time)
     jq.run_daily(send_weekly_summary, time=morning_time, days=(4,))
 
-    logger.info(f"✅ 排程：每天 {MORNING_HOUR:02d}:{MORNING_MINUTE:02d} Asia/Taipei")
+    logger.info(f"✅ 排程：changelog {CHANGELOG_HOUR:02d}:{CHANGELOG_MINUTE:02d} / 早報 {MORNING_HOUR:02d}:{MORNING_MINUTE:02d} Asia/Taipei")
     logger.info(f"📡 監聽中... Chat ID: {CHAT_ID_STR}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
