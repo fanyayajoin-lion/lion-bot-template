@@ -32,6 +32,8 @@ import time
 import pytz
 import requests
 from dotenv import load_dotenv
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -168,18 +170,21 @@ def gh_delete_file(path: str, sha: str) -> bool:
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-def gemini_call(url: str, payload: dict, max_retries: int = 4) -> dict:
+def gemini_call(url: str, payload: dict, max_retries: int = 6) -> dict:
     """Gemini API 呼叫，自動重試 429"""
     for attempt in range(max_retries):
         resp = requests.post(url, json=payload, timeout=120)
         if resp.status_code == 429:
-            wait = 2 ** attempt * 10
-            logger.warning(f"Gemini 限流，{wait}s 後重試...")
+            wait = 2 ** attempt * 15
+            logger.warning(f"Gemini 限流，{wait}s 後重試（第{attempt+1}次）...")
             time.sleep(wait)
             continue
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Gemini API 錯誤 {resp.status_code}") from None
         return resp.json()
-    resp.raise_for_status()
+    raise RuntimeError("Gemini API 達到請求上限，請稍後再試") from None
 
 def gemini_text(prompt: str) -> str:
     url = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -945,7 +950,8 @@ def execute_vault_query(question: str) -> str:
     try:
         return gemini_text(prompt)
     except Exception as e:
-        return f"❌ 查詢失敗：{e}"
+        logger.error(f"知識庫查詢失敗: {e}", exc_info=True)
+        return "❌ 查詢失敗：AI 服務暫時忙碌，請稍後再試"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1140,7 +1146,7 @@ async def setup_receive_goal(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except Exception as e:
         logger.error(f"/setup 失敗: {e}", exc_info=True)
-        await update.message.reply_text(f"設定失敗，請稍後再試：{e}")
+        await update.message.reply_text("設定失敗，請稍後再試")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1193,7 +1199,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     except Exception as e:
         logger.error(f"語音處理失敗: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ 語音處理失敗：{e}")
+        await update.message.reply_text("❌ 語音處理失敗，請稍後再試")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -1222,7 +1228,40 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
     except Exception as e:
         logger.error(f"圖片處理失敗: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ 圖片處理失敗：{e}")
+        await update.message.reply_text("❌ 圖片處理失敗，請稍後再試")
+
+def extract_youtube_video_id(url: str) -> str | None:
+    """從各種 YT URL 格式提取 video ID"""
+    patterns = [
+        r"(?:youtube\.com/watch\?.*v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
+
+def get_youtube_transcript(video_id: str) -> str | None:
+    """取得 YT 字幕，優先繁中 → 簡中 → 英文 → 自動生成"""
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        # 優先順序：手動字幕 > 自動生成，語言：繁中 > 簡中 > 英
+        for lang_codes in [["zh-TW", "zh-Hant"], ["zh", "zh-CN", "zh-Hans"], ["en"]]:
+            try:
+                t = transcript_list.find_transcript(lang_codes)
+                entries = t.fetch()
+                return " ".join(e["text"] for e in entries)
+            except Exception:
+                continue
+        # 最後嘗試任意語言自動生成
+        t = transcript_list.find_generated_transcript(["zh-TW", "zh", "en", "ja"])
+        entries = t.fetch()
+        return " ".join(e["text"] for e in entries)
+    except (TranscriptsDisabled, NoTranscriptFound):
+        return None
+    except Exception as e:
+        logger.warning(f"字幕抓取失敗 {video_id}: {e}")
+        return None
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -1234,9 +1273,30 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔗 收到連結，摘要中...")
     try:
         url = urls[0]
-        summary = gemini_text(
-            f"請整理這個連結的重點，繁體中文：\n1.標題\n2.核心重點3-5點\n3.對傳產數位轉型的啟發\n\n連結：{url}"
-        )
+        video_id = extract_youtube_video_id(url)
+        if video_id:
+            transcript = get_youtube_transcript(video_id)
+            if transcript:
+                prompt = (
+                    f"以下是 YouTube 影片的字幕內容，請用繁體中文整理：\n"
+                    f"1. 影片標題（根據內容推測）\n"
+                    f"2. 核心重點 3-5 點\n"
+                    f"3. 對傳產數位轉型的啟發\n\n"
+                    f"字幕內容（前3000字）：\n{transcript[:3000]}"
+                )
+            else:
+                prompt = (
+                    f"這是一個 YouTube 影片連結，無法取得字幕。\n"
+                    f"請根據網址本身說明無法摘要，並提示使用者手動貼上字幕或說明影片主題。\n"
+                    f"連結：{url}"
+                )
+        else:
+            prompt = (
+                f"請整理這個連結的重點，繁體中文：\n"
+                f"1.標題\n2.核心重點3-5點\n3.對傳產數位轉型的啟發\n\n"
+                f"連結：{url}"
+            )
+        summary = gemini_text(prompt)
         content = f"# 連結摘要 {now_str()}\n\n來源：{url}\n\n{summary}"
         path, meta = save_idea(content, "link")
         preview = summary[:300] + ("..." if len(summary) > 300 else "")
@@ -1245,7 +1305,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"連結處理失敗: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ 連結處理失敗：{e}")
+        await update.message.reply_text("❌ 連結處理失敗，請稍後再試")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
